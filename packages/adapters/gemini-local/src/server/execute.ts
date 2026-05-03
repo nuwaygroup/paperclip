@@ -11,6 +11,7 @@ import {
   adapterExecutionTargetSessionIdentity,
   adapterExecutionTargetSessionMatches,
   adapterExecutionTargetUsesManagedHome,
+  adapterExecutionTargetUsesPaperclipBridge,
   describeAdapterExecutionTarget,
   ensureAdapterExecutionTargetCommandResolvable,
   prepareAdapterExecutionTargetRuntime,
@@ -19,6 +20,7 @@ import {
   resolveAdapterExecutionTargetCommandForLogs,
   runAdapterExecutionTargetProcess,
   runAdapterExecutionTargetShellCommand,
+  startAdapterExecutionTargetPaperclipBridge,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asBoolean,
@@ -268,7 +270,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const runtimeEnv = ensurePathInEnv(effectiveEnv);
   await ensureAdapterExecutionTargetCommandResolvable(command, executionTarget, cwd, runtimeEnv);
   const resolvedCommand = await resolveAdapterExecutionTargetCommandForLogs(command, executionTarget, cwd, runtimeEnv);
-  const loggedEnv = buildInvocationEnvForLogs(env, {
+  let loggedEnv = buildInvocationEnvForLogs(env, {
     runtimeEnv,
     includeRuntimeKeys: ["HOME"],
     resolvedCommand,
@@ -285,6 +287,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let restoreRemoteWorkspace: (() => Promise<void>) | null = null;
   let remoteSkillsDir: string | null = null;
   let localSkillsDir: string | null = null;
+  let remoteRuntimeRootDir: string | null = null;
+  let paperclipBridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
 
   if (executionTargetIsRemote) {
     try {
@@ -304,6 +308,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         }],
       });
       restoreRemoteWorkspace = () => preparedExecutionTargetRuntime.restoreWorkspace();
+      remoteRuntimeRootDir = preparedExecutionTargetRuntime.runtimeRootDir;
       const managedHome = adapterExecutionTargetUsesManagedHome(executionTarget);
       if (managedHome && preparedExecutionTargetRuntime.runtimeRootDir) {
         env.HOME = preparedExecutionTargetRuntime.runtimeRootDir;
@@ -332,6 +337,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
       ]);
       throw error;
+    }
+  }
+  if (executionTargetIsRemote && adapterExecutionTargetUsesPaperclipBridge(executionTarget)) {
+    paperclipBridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId,
+      target: executionTarget,
+      runtimeRootDir: remoteRuntimeRootDir,
+      adapterKey: "gemini",
+      hostApiToken: env.PAPERCLIP_API_KEY,
+      onLog,
+    });
+    if (paperclipBridge) {
+      Object.assign(env, paperclipBridge.env);
+      loggedEnv = buildInvocationEnvForLogs(env, {
+        runtimeEnv: ensurePathInEnv({ ...process.env, ...env }),
+        includeRuntimeKeys: ["HOME"],
+        resolvedCommand,
+      });
     }
   }
 
@@ -508,7 +531,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
     }
 
-    const clearSessionForTurnLimit = isGeminiTurnLimitResult(attempt.parsed.resultEvent, attempt.proc.exitCode);
+    const parsedError = typeof attempt.parsed.errorMessage === "string" ? attempt.parsed.errorMessage.trim() : "";
+    const stderrLine = firstNonEmptyLine(attempt.proc.stderr);
+    const structuredFailure = attempt.parsed.resultEvent
+      ? describeGeminiFailure(attempt.parsed.resultEvent)
+      : null;
+    const fallbackErrorMessage =
+      parsedError ||
+      structuredFailure ||
+      stderrLine ||
+      `Gemini exited with code ${attempt.proc.exitCode ?? -1}`;
+    const failed = (attempt.proc.exitCode ?? 0) !== 0;
+    const clearSessionForTurnLimit = isGeminiTurnLimitResult(
+      attempt.parsed.resultEvent,
+      attempt.proc.exitCode,
+    );
 
     // On retry, don't fall back to old session ID — the old session was stale
     const canFallbackToRuntimeSession = !isRetry;
@@ -528,23 +565,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           : {}),
       } as Record<string, unknown>)
       : null;
-    const parsedError = typeof attempt.parsed.errorMessage === "string" ? attempt.parsed.errorMessage.trim() : "";
-    const stderrLine = firstNonEmptyLine(attempt.proc.stderr);
-    const structuredFailure = attempt.parsed.resultEvent
-      ? describeGeminiFailure(attempt.parsed.resultEvent)
-      : null;
-    const fallbackErrorMessage =
-      parsedError ||
-      structuredFailure ||
-      stderrLine ||
-      `Gemini exited with code ${attempt.proc.exitCode ?? -1}`;
+    const resultJson: Record<string, unknown> = {
+      ...(attempt.parsed.resultEvent ?? {
+        stdout: attempt.proc.stdout,
+        stderr: attempt.proc.stderr,
+      }),
+      ...(failed && clearSessionForTurnLimit ? { stopReason: "max_turns_exhausted" } : {}),
+    };
 
     return {
       exitCode: attempt.proc.exitCode,
       signal: attempt.proc.signal,
       timedOut: false,
-      errorMessage: (attempt.proc.exitCode ?? 0) === 0 ? null : fallbackErrorMessage,
-      errorCode: (attempt.proc.exitCode ?? 0) !== 0 && authMeta.requiresAuth ? "gemini_auth_required" : null,
+      errorMessage: failed ? fallbackErrorMessage : null,
+      errorCode: failed && authMeta.requiresAuth
+        ? "gemini_auth_required"
+        : failed && clearSessionForTurnLimit
+        ? "max_turns_exhausted"
+        : null,
       usage: attempt.parsed.usage,
       sessionId: resolvedSessionId,
       sessionParams: resolvedSessionParams,
@@ -554,10 +592,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       model,
       billingType,
       costUsd: attempt.parsed.costUsd,
-      resultJson: attempt.parsed.resultEvent ?? {
-        stdout: attempt.proc.stdout,
-        stderr: attempt.proc.stderr,
-      },
+      resultJson,
       summary: attempt.parsed.summary,
       question: attempt.parsed.question,
       clearSession: clearSessionForTurnLimit || Boolean(clearSessionOnMissingSession && !resolvedSessionId),
@@ -583,6 +618,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     return toResult(initial);
   } finally {
     await Promise.all([
+      paperclipBridge?.stop(),
       restoreRemoteWorkspace?.(),
       localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
     ]);
