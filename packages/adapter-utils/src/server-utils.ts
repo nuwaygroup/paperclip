@@ -379,8 +379,28 @@ type PaperclipWakeTreeHoldSummary = {
   reason: string | null;
 };
 
+type PaperclipWakeCostDataPerAgent = {
+  agentId: string;
+  name: string;
+  role: string;
+  spentMonthlyCents: number;
+  budgetMonthlyCents: number;
+  totalCostCents: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+};
+
+type PaperclipWakeCostData = {
+  companySpendCents: number;
+  companyBudgetCents: number;
+  companyUtilizationPercent: number;
+  remainingBudgetBeforePreAuthThresholdCents: number;
+  perAgent: PaperclipWakeCostDataPerAgent[];
+};
+
 type PaperclipWakePayload = {
   reason: string | null;
+  costData: PaperclipWakeCostData | null;
   issue: PaperclipWakeIssue | null;
   checkedOutByHarness: boolean;
   dependencyBlockedInteraction: boolean;
@@ -553,6 +573,36 @@ function normalizePaperclipWakeExecutionStage(value: unknown): PaperclipWakeExec
   };
 }
 
+function normalizePaperclipWakeCostData(value: unknown): PaperclipWakeCostData | null {
+  const data = parseObject(value);
+  if (typeof data.companySpendCents !== "number" && typeof data.companyBudgetCents !== "number") return null;
+  const perAgent = Array.isArray(data.perAgent)
+    ? data.perAgent
+        .map((entry: unknown) => {
+          const agent = parseObject(entry);
+          if (typeof agent.agentId !== "string" || !agent.agentId.trim()) return null;
+          return {
+            agentId: agent.agentId.trim(),
+            name: asString(agent.name, "").trim(),
+            role: asString(agent.role, "").trim(),
+            spentMonthlyCents: asNumber(agent.spentMonthlyCents, 0),
+            budgetMonthlyCents: asNumber(agent.budgetMonthlyCents, 0),
+            totalCostCents: asNumber(agent.totalCostCents, 0),
+            totalInputTokens: asNumber(agent.totalInputTokens, 0),
+            totalOutputTokens: asNumber(agent.totalOutputTokens, 0),
+          };
+        })
+        .filter((entry): entry is PaperclipWakeCostDataPerAgent => entry !== null)
+    : [];
+  return {
+    companySpendCents: asNumber(data.companySpendCents, 0),
+    companyBudgetCents: asNumber(data.companyBudgetCents, 0),
+    companyUtilizationPercent: asNumber(data.companyUtilizationPercent, 0),
+    remainingBudgetBeforePreAuthThresholdCents: asNumber(data.remainingBudgetBeforePreAuthThresholdCents, 0),
+    perAgent,
+  };
+}
+
 export function normalizePaperclipWakePayload(value: unknown): PaperclipWakePayload | null {
   const payload = parseObject(value);
   const comments = Array.isArray(payload.comments)
@@ -586,12 +636,14 @@ export function normalizePaperclipWakePayload(value: unknown): PaperclipWakePayl
     : [];
 
   const activeTreeHold = normalizePaperclipWakeTreeHoldSummary(payload.activeTreeHold);
-  if (comments.length === 0 && commentIds.length === 0 && childIssueSummaries.length === 0 && unresolvedBlockerIssueIds.length === 0 && unresolvedBlockerSummaries.length === 0 && !activeTreeHold && !executionStage && !continuationSummary && !livenessContinuation && !normalizePaperclipWakeIssue(payload.issue)) {
+  const costData = normalizePaperclipWakeCostData(payload.costData);
+  if (comments.length === 0 && commentIds.length === 0 && childIssueSummaries.length === 0 && unresolvedBlockerIssueIds.length === 0 && unresolvedBlockerSummaries.length === 0 && !activeTreeHold && !executionStage && !continuationSummary && !livenessContinuation && !costData && !normalizePaperclipWakeIssue(payload.issue)) {
     return null;
   }
 
   return {
     reason: asString(payload.reason, "").trim() || null,
+    costData,
     issue: normalizePaperclipWakeIssue(payload.issue),
     checkedOutByHarness: asBoolean(payload.checkedOutByHarness, false),
     dependencyBlockedInteraction: asBoolean(payload.dependencyBlockedInteraction, false),

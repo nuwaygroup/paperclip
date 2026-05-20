@@ -27,6 +27,7 @@ import {
   agentWakeupRequests,
   activityLog,
   approvals,
+  companies as companiesTable,
   companySkills as companySkillsTable,
   documentRevisions,
   issueDocuments,
@@ -1996,8 +1997,57 @@ async function buildPaperclipWakePayload(input: {
     });
   }
 
+  const companyRow = await input.db
+    .select({
+      budgetMonthlyCents: companiesTable.budgetMonthlyCents,
+      spentMonthlyCents: companiesTable.spentMonthlyCents,
+    })
+    .from(companiesTable)
+    .where(eq(companiesTable.id, input.companyId))
+    .then((rows) => rows[0] ?? null);
+
+  const agentRows = await input.db
+    .select({
+      agentId: agents.id,
+      name: agents.name,
+      role: agents.role,
+      spentMonthlyCents: agents.spentMonthlyCents,
+      budgetMonthlyCents: agents.budgetMonthlyCents,
+      totalCostCents: agentRuntimeState.totalCostCents,
+      totalInputTokens: agentRuntimeState.totalInputTokens,
+      totalOutputTokens: agentRuntimeState.totalOutputTokens,
+    })
+    .from(agents)
+    .leftJoin(agentRuntimeState, eq(agents.id, agentRuntimeState.agentId))
+    .where(eq(agents.companyId, input.companyId));
+
+  const companySpendCents = companyRow?.spentMonthlyCents ?? 0;
+  const companyBudgetCents = companyRow?.budgetMonthlyCents ?? 0;
+  const companyUtilizationPercent = companyBudgetCents > 0
+    ? Math.round((companySpendCents / companyBudgetCents) * 10000) / 100
+    : 0;
+  const PRE_AUTH_THRESHOLD_CENTS = 7500;
+
+  const costData = {
+    companySpendCents,
+    companyBudgetCents,
+    companyUtilizationPercent,
+    remainingBudgetBeforePreAuthThresholdCents: Math.max(0, PRE_AUTH_THRESHOLD_CENTS - companySpendCents),
+    perAgent: agentRows.map((row) => ({
+      agentId: row.agentId,
+      name: row.name,
+      role: row.role,
+      spentMonthlyCents: row.spentMonthlyCents,
+      budgetMonthlyCents: row.budgetMonthlyCents,
+      totalCostCents: Number(row.totalCostCents ?? 0),
+      totalInputTokens: Number(row.totalInputTokens ?? 0),
+      totalOutputTokens: Number(row.totalOutputTokens ?? 0),
+    })),
+  };
+
   return {
     reason: readNonEmptyString(input.contextSnapshot.wakeReason),
+    costData,
     issue: issueSummary
       ? {
           id: issueSummary.id,
